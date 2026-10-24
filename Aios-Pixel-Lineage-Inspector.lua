@@ -1,4 +1,4 @@
--- AIOS / Pixel Lineage Inspector 1.0 - client-visible diagnostic report only.
+-- AIOS / Pixel Lineage Inspector 1.1 - prioritized Shared/client metadata report.
 -- Made by Ilham Ziqri. Standalone; does not replace the AIOS HUB file.
 -- Never invokes remotes, executes a game module, hooks calls, or changes gameplay.
 -- Optional executor inspection functions are detected and protected with pcall.
@@ -12,17 +12,18 @@
 local function buildReport(deps)
     local game,player=deps.game,deps.player
     local caps=deps.caps or{}
-    local limits={nodes=12000,remotes=200,scripts=220,analysis=60,source=1024*1024,
-        sourceTotal=3*1024*1024,functions=96,depth=4,constants=1500,hints=64,bytes=140000}
+    local limits={nodes=12000,remotes=200,scripts=600,analysis=120,source=1024*1024,
+        sourceTotal=3*1024*1024,functions=96,depth=4,constants=1500,hints=96,bytes=180000}
     local stats={nodes=0,remotes=0,scripts=0,analyzed=0,sources=0,closures=0,functions=0,
-        constants=0,errors=0,roots=0,truncated=false}
+        constants=0,errors=0,roots=0,truncated=false,shared=0,client=0,analyzedShared=0,analyzedClient=0,
+        protoCalls=0,protoEmpty=0,protoChildren=0,protoFallback=0}
     local lines,bytes={},0
     local function clean(value,max)
         return tostring(value or""):gsub("[%c]"," "):sub(1,max or 180)
     end
-    local function add(value)
+    local function add(value,summary)
         value=tostring(value or"")
-        if bytes+#value+1>limits.bytes then stats.truncated=true;return false end
+        if bytes+#value+1>limits.bytes-(summary and 0 or 2200)then stats.truncated=true;return false end
         lines[#lines+1]=value;bytes=bytes+#value+1;return true
     end
     local function cancelled()return deps.cancelled and deps.cancelled()end
@@ -53,13 +54,33 @@ local function buildReport(deps)
         for _,word in ipairs(needles)do if low:find(word,1,true)then return true end end
         return false
     end
-    local function priority(name)
+    local essential={gameconfig=true,gearconfig=true,combatconfig=true,combatrules=true,battlecommandrules=true,
+        rpgclient=true,pixelgearview=true,inventorybrowse=true,inventoryweaponstats=true,lootrules=true,lootconfig=true,
+        rewardconfig=true,adminpermissions=true,adminconsolemodel=true,admingeareditor=true,marketgiveaways=true}
+    local cosmetics={"visual","presentation","preview","showcase","animation","sound","audio","camera","icons","backdrop","layout","feel"}
+    local function priority(name,shared)
         local low=name:lower()
-        for _,word in ipairs(needles)do if low:find(word,1,true)then return 1 end end
-        return 2
+        if low=="gameconfig"or low=="gearconfig"then return 0 end
+        if essential[low]then return 1 end
+        for _,word in ipairs(cosmetics)do if low:find(word,1,true)then return 9 end end
+        if low:match("art$")or low:match("fx$")then return 9 end
+        for _,word in ipairs(needles)do if low:find(word,1,true)then return shared and 2 or 4 end end
+        return shared and 3 or 7
+    end
+    local function before(a,b)
+        if a.rank~=b.rank then return a.rank<b.rank end
+        return a.path<b.path
+    end
+    local function hintRank(value)
+        local low=value:lower()
+        if low=="fireserver"or low=="invokeserver"or low=="combataction"or low=="gearsell"or low=="rpgcommand"then return 0 end
+        for _,word in ipairs(cosmetics)do if low:find(word,1,true)then return 9 end end
+        if low:find("tooltip",1,true)or low:find("button",1,true)or low:find("scale",1,true)or low:match("fx$")then return 9 end
+        if low:find("give",1,true)or low:find("grant",1,true)or low:find("claim",1,true)or low:find("sell",1,true)then return 1 end
+        return 3
     end
 
-    add("AIOS PIXEL LINEAGE - LAPORAN PEMERIKSAAN CLIENT v1.0")
+    add("AIOS PIXEL LINEAGE - LAPORAN PEMERIKSAAN CLIENT v1.1")
     add("Waktu UTC: "..os.date("!%Y-%m-%dT%H:%M:%SZ"))
     add("GameId: "..tostring(game.GameId).." | PlaceId: "..tostring(game.PlaceId))
     add("Mode: snapshot baca-saja. Tidak ada remote yang dipanggil atau modul yang dijalankan.")
@@ -68,7 +89,7 @@ local function buildReport(deps)
     add("Tidak mengumpulkan profil, UserId, username, kunci, atau isi skrip lengkap.")
     add("")
     add("KEMAMPUAN PEMERIKSAAN")
-    for _,name in ipairs({"getscriptclosure","getconstants","getprotos"})do
+    for _,name in ipairs({"getscriptclosure","getconstants","getprotos","getproto"})do
         add(name..": "..(type(caps[name])=="function"and"tersedia (masih bisa ditolak per skrip)"or"tidak tersedia"))
     end
     add("writefile: "..(caps.writefile and"tersedia"or"tidak tersedia").." | clipboard: "..(caps.clipboard and"tersedia"or"tidak tersedia"))
@@ -109,9 +130,19 @@ local function buildReport(deps)
                 else stats.truncated=true end
             elseif class=="ModuleScript"or class=="LocalScript"then
                 stats.scripts=stats.scripts+1
+                local fullPath=path(object)
+                local shared=fullPath:find("ReplicatedStorage.PlatformBattles.Shared.",1,true)==1
+                if shared then stats.shared=stats.shared+1 else stats.client=stats.client+1 end
+                local entry={object=object,kind=class,path=fullPath,shared=shared,rank=priority(object.Name,shared)}
                 if #foundScripts<limits.scripts then
-                    foundScripts[#foundScripts+1]={object=object,kind=class,path=path(object),rank=priority(object.Name)}
-                else stats.truncated=true end
+                    foundScripts[#foundScripts+1]=entry
+                else
+                    -- Retain the best candidates, even when they arrive after many client UI scripts.
+                    stats.truncated=true
+                    local worst=1
+                    for n=2,#foundScripts do if before(foundScripts[worst],foundScripts[n])then worst=n end end
+                    if before(entry,foundScripts[worst])then foundScripts[worst]=entry end
+                end
             end
             local ok,children=pcall(function()return object:GetChildren()end)
             if ok and type(children)=="table"then
@@ -124,26 +155,41 @@ local function buildReport(deps)
     end
     if at<=#queue then stats.truncated=true end
     table.sort(foundRemotes,function(a,b)return a.path<b.path end)
-    table.sort(foundScripts,function(a,b)if a.rank~=b.rank then return a.rank<b.rank end;return a.path<b.path end)
+    table.sort(foundScripts,before)
+    local focused={}
+    for _,entry in ipairs(foundScripts)do if entry.rank<9 then focused[#focused+1]=entry end end
+    local selected=math.min(#focused,limits.analysis)
     add("")
     add("REMOTE YANG TERLIHAT (nama/path; tidak dipanggil)")
     if #foundRemotes==0 then add("Tidak ditemukan pada root yang diperiksa.")end
     for _,entry in ipairs(foundRemotes)do add(entry.kind.." | "..entry.path)end
     add("")
-    add("MODUL DAN LOCAL SCRIPT YANG TERLIHAT")
-    for _,entry in ipairs(foundScripts)do add(entry.kind.." | "..entry.path)end
+    add("PEMILIHAN PEMERIKSAAN")
+    add(string.format("Skrip ditemukan: %d (Shared: %d; client/lainnya: %d). Metadata disimpan: %d.",stats.scripts,stats.shared,stats.client,#foundScripts))
+    add(string.format("Menganalisis %d modul prioritas. GameConfig, GearConfig, aturan game, dan pengendali client diperiksa lebih dahulu.",selected))
+    add("Modul kosmetik diturunkan prioritasnya. Nama Admin* bukan bukti hak admin atau izin memberi item.")
     add("")
     add("PETUNJUK KODE CLIENT (terbatas; skrip game tidak dieksekusi)")
     local sourceBytes=0
-    for index=1,math.min(#foundScripts,limits.analysis)do
+    for index=1,selected do
         if cancelled()then return nil,stats end
-        local entry=foundScripts[index]
+        local entry=focused[index]
         stats.analyzed=stats.analyzed+1
-        if deps.progress then deps.progress("Memeriksa "..index.."/"..math.min(#foundScripts,limits.analysis)..": "..clean(entry.object.Name,60))end
+        if entry.shared then stats.analyzedShared=stats.analyzedShared+1 else stats.analyzedClient=stats.analyzedClient+1 end
+        if deps.progress then deps.progress("Memeriksa "..index.."/"..selected..": "..clean(entry.object.Name,60))end
         local hints,seenHints,commands={}, {},{}
         local function hint(value)
-            if #hints<limits.hints and interesting(value)and not seenHints[value]then
+            if not interesting(value)or seenHints[value]then return end
+            if #hints<limits.hints then
                 seenHints[value]=true;hints[#hints+1]=value
+            else
+                local worst=1
+                for n=2,#hints do
+                    if hintRank(hints[n])>hintRank(hints[worst])then worst=n end
+                end
+                if hintRank(value)<hintRank(hints[worst])then
+                    seenHints[hints[worst]]=nil;hints[worst]=value;seenHints[value]=true
+                end
             end
         end
         local readable,source=pcall(function()return entry.object.Source end)
@@ -164,6 +210,7 @@ local function buildReport(deps)
         source=nil
         local closureStatus="fungsi pemeriksaan tidak tersedia"
         local functions=0
+        local protoCalls,protoEmpty,protoChildren,protoFallback=0,0,0,0
         if type(caps.getscriptclosure)=="function"and type(caps.getconstants)=="function"then
             local ok,closure=pcall(caps.getscriptclosure,entry.object)
             if ok and type(closure)=="function"then
@@ -187,16 +234,36 @@ local function buildReport(deps)
                                 hint(value)
                             end
                         else stats.errors=stats.errors+1 end
-                        if item.depth<limits.depth and type(caps.getprotos)=="function"then
-                            local got,children=pcall(caps.getprotos,item.fn)
-                            if got and type(children)=="table"then
-                                for _,value in pairs(children)do
-                                    if #pending>=limits.functions then stats.truncated=true;break end
-                                    if type(value)=="function"and not visited[value]then
-                                        pending[#pending+1]={fn=value,depth=item.depth+1}
+                        if item.depth<limits.depth then
+                            local returned=0
+                            local function enqueue(value)
+                                if type(value)~="function"then return end
+                                returned=returned+1;protoChildren=protoChildren+1
+                                if #pending>=limits.functions then stats.truncated=true;return end
+                                if not visited[value]then pending[#pending+1]={fn=value,depth=item.depth+1}end
+                            end
+                            if type(caps.getprotos)=="function"then
+                                protoCalls=protoCalls+1
+                                local got,children=pcall(caps.getprotos,item.fn)
+                                if got and type(children)=="table"then
+                                    local examined=0
+                                    for _,value in pairs(children)do
+                                        examined=examined+1;if examined>limits.functions then stats.truncated=true;break end
+                                        enqueue(value)
                                     end
+                                    if returned==0 then protoEmpty=protoEmpty+1 end
+                                else stats.errors=stats.errors+1 end
+                            end
+                            -- Some executors expose getprotos but return an empty table.
+                            -- Probe individual inactive protos when that separate API exists.
+                            if returned==0 and type(caps.getproto)=="function"then
+                                for protoIndex=1,32 do
+                                    local got,value=pcall(caps.getproto,item.fn,protoIndex,false)
+                                    if not got or type(value)~="function"then break end
+                                    protoFallback=protoFallback+1;enqueue(value)
+                                    if #pending>=limits.functions then break end
                                 end
-                            else stats.errors=stats.errors+1 end
+                            end
                         end
                         if functions%16==0 and yield()then return nil,stats end
                     end
@@ -204,22 +271,33 @@ local function buildReport(deps)
                 if cursor<=#pending then stats.truncated=true end
             else closureStatus="tidak tersedia untuk skrip ini"end
         end
-        table.sort(hints)
+        stats.protoCalls=stats.protoCalls+protoCalls;stats.protoEmpty=stats.protoEmpty+protoEmpty
+        stats.protoChildren=stats.protoChildren+protoChildren;stats.protoFallback=stats.protoFallback+protoFallback
+        table.sort(hints,function(a,b)if hintRank(a)~=hintRank(b)then return hintRank(a)<hintRank(b)end;return a<b end)
         add("")
         add(entry.path)
         add("  Source: "..sourceStatus.." | Metadata: "..closureStatus.." | Fungsi diperiksa: "..functions)
+        add(string.format("  Proto: pemeriksaan=%d; daftar kosong=%d; anak terbaca=%d; fallback indeks=%d",protoCalls,protoEmpty,protoChildren,protoFallback))
         add("  Identifier gameplay: "..(#hints>0 and table.concat(hints,", ")or"tidak ada yang terbaca"))
         if #commands>0 then add("  Pola teks pemanggilan (bisa juga komentar/string): "..table.concat(commands,"; "))end
         if yield()then return nil,stats end
     end
-    if #foundScripts>limits.analysis then stats.truncated=true end
+    if #foundScripts>selected then stats.truncated=true end
     add("")
-    add("RINGKASAN")
-    add(string.format("Root: %d | Objek: %d | Remote: %d | Skrip: %d | Dianalisis: %d",stats.roots,stats.nodes,stats.remotes,stats.scripts,stats.analyzed))
-    add(string.format("Source terbaca: %d | Closure terbaca: %d | Tabel konstanta terbaca: %d | Pemeriksaan ditolak/gagal: %d",stats.sources,stats.closures,stats.constants,stats.errors))
-    add("Cakupan: "..(stats.truncated and"dibatasi; ada bagian yang tidak diperiksa/ditampilkan"or"root yang tersedia telah diperiksa dalam batas laporan"))
-    add("Tidak membaca ServerScriptService, ServerStorage, heap global, upvalue, profil, atau lalu lintas pemain.")
-    add("Hasil ini belum membuktikan spawn item atau one hit kill bisa dilakukan.")
+    add("LAMPIRAN METADATA MODUL/LOCAL SCRIPT (diurutkan menurut prioritas)")
+    for _,entry in ipairs(foundScripts)do if not add(entry.kind.." | "..entry.path)then break end end
+    add("",true)
+    add("RINGKASAN",true)
+    add(string.format("Root: %d | Objek: %d | Remote: %d | Skrip: %d | Dianalisis: %d",stats.roots,stats.nodes,stats.remotes,stats.scripts,stats.analyzed),true)
+    add(string.format("Analisis Shared: %d | Analisis client/lainnya: %d",stats.analyzedShared,stats.analyzedClient),true)
+    add(string.format("Source terbaca: %d | Closure terbaca: %d | Tabel konstanta terbaca: %d | Pemeriksaan ditolak/gagal: %d",stats.sources,stats.closures,stats.constants,stats.errors),true)
+    add(string.format("Proto: pemeriksaan=%d; daftar kosong=%d; anak terbaca=%d; fallback indeks=%d",stats.protoCalls,stats.protoEmpty,stats.protoChildren,stats.protoFallback),true)
+    if stats.closures>0 and stats.functions==stats.closures then
+        add("Catatan: hanya fungsi terluar yang terbaca. Bisa karena tidak ada proto yang tersedia atau keterbatasan implementasi executor; belum bisa dibedakan dari laporan ini.",true)
+    end
+    add("Cakupan: "..(stats.truncated and"dibatasi; ada bagian yang tidak diperiksa/ditampilkan"or"root yang tersedia telah diperiksa dalam batas laporan"),true)
+    add("Tidak membaca ServerScriptService, ServerStorage, heap global, upvalue, profil, atau lalu lintas pemain.",true)
+    add("Hasil ini belum membuktikan spawn item atau one hit kill bisa dilakukan.",true)
     if stats.truncated then lines[#lines+1]="\n[PEMERIKSAAN DIBATASI; LAPORAN BUKAN HASIL LENGKAP]"end
     return table.concat(lines,"\n"),stats
 end
@@ -284,7 +362,7 @@ local panel=create("Frame",{Name="Panel",AnchorPoint=Vector2.new(.5,.5),Position
     BackgroundColor3=rgb(20,24,32),BorderSizePixel=0,Parent=screen})
 create("UICorner",{CornerRadius=UDim.new(0,14),Parent=panel})
 create("UIStroke",{Color=rgb(230,143,66),Transparency=.25,Thickness=1,Parent=panel})
-local title=create("TextLabel",{Name="Title",Text="AIOS Inspector",Font=Enum.Font.GothamBold,TextSize=22,
+local title=create("TextLabel",{Name="Title",Text="AIOS Inspector 1.1",Font=Enum.Font.GothamBold,TextSize=22,
     TextColor3=rgb(255,176,94),TextXAlignment=Enum.TextXAlignment.Left,BackgroundTransparency=1,
     Position=UDim2.fromOffset(18,12),Size=UDim2.new(1,-78,0,28),Parent=panel})
 local close=create("TextButton",{Name="Close",Text="×",TextSize=28,Font=Enum.Font.Gotham,
@@ -333,6 +411,7 @@ local debugTable=type(debug)=="table"and debug or{}
 local caps={getscriptclosure=type(getscriptclosure)=="function"and getscriptclosure or nil,
     getconstants=type(getconstants)=="function"and getconstants or debugTable.getconstants,
     getprotos=type(getprotos)=="function"and getprotos or debugTable.getprotos,
+    getproto=type(getproto)=="function"and getproto or debugTable.getproto,
     writefile=type(writefile)=="function",clipboard=type(setclipboard)=="function"or type(toclipboard)=="function"}
 local clipboard=type(setclipboard)=="function"and setclipboard or type(toclipboard)=="function"and toclipboard or nil
 local exporter=makeExporter({writefile=writefile,readfile=readfile,isfile=isfile,clipboard=clipboard,newName=function()
