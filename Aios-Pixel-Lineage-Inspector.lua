@@ -1,8 +1,9 @@
--- AIOS / Pixel Lineage Inspector 1.1 - prioritized Shared/client metadata report.
+-- AIOS / Pixel Lineage Inspector 1.2 - self-tests and scoped loaded-function metadata.
 -- Made by Ilham Ziqri. Standalone; does not replace the AIOS HUB file.
 -- Never invokes remotes, executes a game module, hooks calls, or changes gameplay.
 -- Optional executor inspection functions are detected and protected with pcall.
--- No player identifiers, keys, profile contents or full script sources are exported.
+-- getgc(false) is used only to find functions belonging to selected game scripts.
+-- No GC tables, upvalues, player identifiers, keys, profiles or full sources are exported.
 -- References: create.roblox.com/docs/scripting/events/remote
 -- docs.sunc.io/Scripts/getscriptclosure/ and docs.sunc.io/Debug/getconstants/
 --!nocheck
@@ -13,10 +14,12 @@ local function buildReport(deps)
     local game,player=deps.game,deps.player
     local caps=deps.caps or{}
     local limits={nodes=12000,remotes=200,scripts=600,analysis=120,source=1024*1024,
-        sourceTotal=3*1024*1024,functions=96,depth=4,constants=1500,hints=96,bytes=180000}
+        sourceTotal=3*1024*1024,functions=96,depth=4,constants=1500,hints=96,bytes=180000,
+        liveReferences=80000,liveFunctions=1800,livePerScript=160,liveRows=160,liveHints=24}
     local stats={nodes=0,remotes=0,scripts=0,analyzed=0,sources=0,closures=0,functions=0,
         constants=0,errors=0,roots=0,truncated=false,shared=0,client=0,analyzedShared=0,analyzedClient=0,
-        protoCalls=0,protoEmpty=0,protoChildren=0,protoFallback=0}
+        protoCalls=0,protoEmpty=0,protoChildren=0,protoFallback=0,
+        liveReferences=0,liveFunctions=0,liveConstants=0,liveUnmapped=0,liveDenied=0,liveRows=0,liveStatus="belum diperiksa"}
     local lines,bytes={},0
     local function clean(value,max)
         return tostring(value or""):gsub("[%c]"," "):sub(1,max or 180)
@@ -45,7 +48,8 @@ local function buildReport(deps)
     end
     local needles={"combat","damage","health","attack","kill","hit","item","inventory","gear","loot",
         "drop","reward","grant","give","spawn","admin","profile","rpg","sell","purchase","buy","chest",
-        "claim","redeem","equip","skill","remote","fireserver","invokeserver","target","battle"}
+        "claim","redeem","equip","skill","remote","fireserver","invokeserver","target","battle",
+        "actionid","revision","turnnumber","context","hero","uid"}
     local blocked={"password","token","secret","cookie","hwid","webhook","license","auth","sessionkey","apikey"}
     local function interesting(value)
         if type(value)~="string"or#value<3 or#value>72 or not value:match("^[A-Za-z_][A-Za-z0-9_.:]*$")then return false end
@@ -80,7 +84,153 @@ local function buildReport(deps)
         return 3
     end
 
-    add("AIOS PIXEL LINEAGE - LAPORAN PEMERIKSAAN CLIENT v1.1")
+    local function selfTests()
+        -- This is our own harmless function, not a game function or module.
+        local function holder()
+            local function nested(text)return "AIOS_INSPECTOR_LOCAL_PROBE_12"..text end
+            return nested
+        end
+        local sample=holder()
+        local function outcome(value)
+            return value==nil and"tidak tersedia"or value and"lulus"or"gagal/kosong pada fungsi uji sendiri"
+        end
+        if type(caps.getconstants)=="function"then
+            stats.selfConstants=false
+            local ok,values=pcall(caps.getconstants,sample)
+            if ok and type(values)=="table"then
+                local count=0
+                for _,value in pairs(values)do
+                    count=count+1;if count>1500 then break end
+                    if value=="AIOS_INSPECTOR_LOCAL_PROBE_12"then stats.selfConstants=true;break end
+                end
+            end
+        end
+        if type(caps.getprotos)=="function"then
+            stats.selfProtos=false
+            local ok,values=pcall(caps.getprotos,holder)
+            if ok and type(values)=="table"then
+                local count=0
+                for _,value in pairs(values)do
+                    count=count+1;if count>96 then break end
+                    if type(value)=="function"then stats.selfProtos=true;break end
+                end
+            end
+        end
+        if type(caps.getproto)=="function"then
+            local ok,value=pcall(caps.getproto,holder,1,false)
+            stats.selfProto=ok and type(value)=="function"
+        end
+        add("TES LOKAL API EXECUTOR (pada fungsi buatan pemeriksa sendiri)")
+        add("getconstants: "..outcome(stats.selfConstants))
+        add("getprotos: "..outcome(stats.selfProtos))
+        add("getproto: "..outcome(stats.selfProto))
+        add("Tes ini memisahkan API yang hanya tersedia namanya dari API yang mengembalikan metadata uji.")
+        add("")
+    end
+    local function inspectLoaded(entries)
+        add("FUNGSI CLIENT YANG SUDAH DIMUAT (metadata saja; tanpa dekompilasi)")
+        add("Metode: getgc(false), lalu getfenv(...).script dicocokkan dengan modul game yang dipilih.")
+        add("Tabel GC/profil tidak diperiksa. Fungsi game tidak dipanggil; konstanta fungsi terkait saja yang dibaca.")
+        if type(caps.getgc)~="function"or type(caps.getfenv)~="function"or type(caps.getconstants)~="function"then
+            stats.liveStatus="API pembacaan fungsi belum tersedia"
+            add(stats.liveStatus);return true
+        end
+        if stats.selfConstants~=true then
+            stats.liveStatus="dilewati: getconstants tidak lulus tes lokal"
+            add(stats.liveStatus);return true
+        end
+        local allowed={}
+        for _,entry in ipairs(entries)do if entry.rank<=4 then allowed[entry.object]=entry end end
+        local ok,references=pcall(caps.getgc,false)
+        if not ok or type(references)~="table"then
+            stats.liveStatus="getgc(false) ditolak atau tidak mengembalikan daftar"
+            add(stats.liveStatus);return true
+        end
+        local perScript,seenFunctions,rows={},{},{}
+        local function rowBefore(a,b)
+            if a.rank~=b.rank then return a.rank<b.rank end
+            if a.path~=b.path then return a.path<b.path end
+            return a.order<b.order
+        end
+        for _,fn in pairs(references)do
+            if cancelled()then return false end
+            stats.liveReferences=stats.liveReferences+1
+            if stats.liveReferences>limits.liveReferences then stats.truncated=true;break end
+            if type(fn)=="function"and not seenFunctions[fn]then
+                seenFunctions[fn]=true
+                local executorFunction=false
+                if type(caps.isexecutorclosure)=="function"then
+                    local passed,value=pcall(caps.isexecutorclosure,fn)
+                    executorFunction=passed and value==true
+                end
+                if not executorFunction then
+                    local got,environment=pcall(caps.getfenv,fn)
+                    local origin=got and type(environment)=="table"and rawget(environment,"script")or nil
+                    local entry=origin and allowed[origin]
+                    if not entry then stats.liveUnmapped=stats.liveUnmapped+1
+                    elseif (perScript[origin]or 0)<limits.livePerScript then
+                        stats.liveFunctions=stats.liveFunctions+1
+                        perScript[origin]=(perScript[origin]or 0)+1
+                        local passed,constants=pcall(caps.getconstants,fn)
+                        if passed and type(constants)=="table"then
+                            stats.liveConstants=stats.liveConstants+1
+                            local names,used={},{}
+                            local count=0
+                            for _,value in pairs(constants)do
+                                count=count+1;if count>limits.constants then stats.truncated=true;break end
+                                if interesting(value)and not used[value]then
+                                    used[value]=true;names[#names+1]=value
+                                end
+                            end
+                            table.sort(names,function(a,b)if hintRank(a)~=hintRank(b)then return hintRank(a)<hintRank(b)end;return a<b end)
+                            if #names>0 then
+                                while #names>limits.liveHints do names[#names]=nil end
+                                local name,nargs,varargs="tanpa nama",nil,nil
+                                if type(caps.info)=="function"then
+                                    local named,value=pcall(caps.info,fn,"n")
+                                    if named and type(value)=="string"and value:match("^[A-Za-z_][A-Za-z0-9_.:]*$")then
+                                        local low=value:lower();local safe=true
+                                        for _,word in ipairs(blocked)do if low:find(word,1,true)then safe=false;break end end
+                                        if safe then name=clean(value,72)end
+                                    end
+                                    local counted,n,v=pcall(caps.info,fn,"a")
+                                    if counted and type(n)=="number"and n>=0 and n<=100 and n==math.floor(n)then nargs=n;varargs=v==true end
+                                end
+                                local row={path=entry.path,name=name,nargs=nargs,varargs=varargs,names=names,rank=hintRank(names[1]),order=stats.liveFunctions}
+                                if #rows<limits.liveRows then rows[#rows+1]=row
+                                else
+                                    stats.truncated=true
+                                    local worst=1
+                                    for n=2,#rows do if rowBefore(rows[worst],rows[n])then worst=n end end
+                                    if rowBefore(row,rows[worst])then rows[worst]=row end
+                                end
+                            end
+                        else stats.liveDenied=stats.liveDenied+1 end
+                        if stats.liveFunctions>=limits.liveFunctions then stats.truncated=true;break end
+                    else stats.truncated=true end
+                end
+            end
+            if stats.liveReferences%160==0 then
+                if deps.progress then deps.progress("Mencocokkan fungsi client: "..stats.liveReferences.." referensi; "..stats.liveConstants.." metadata terbaca")end
+                if yield()then return false end
+            end
+        end
+        references=nil;seenFunctions=nil
+        table.sort(rows,rowBefore)
+        stats.liveRows=#rows
+        for _,row in ipairs(rows)do
+            add("")
+            add(row.path.." | "..row.name..(row.nargs and(" | parameter="..row.nargs..(row.varargs and" + vararg"or""))or""))
+            add("  Konstanta identifier: "..table.concat(row.names,", "))
+        end
+        stats.liveStatus=stats.liveConstants>0 and"metadata fungsi terkait berhasil dibaca"or"belum ada metadata fungsi terkait yang berhasil dibaca"
+        add("")
+        add(stats.liveStatus..". Ini bukan rekaman panggilan atau bukti server menerima suatu perintah.")
+        if stats.liveConstants==0 then add("Buka bag dan lakukan satu serangan biasa secara manual, lalu Cek ulang. Jika tetap nol, metode ini tidak memperoleh akses yang diperlukan dari executor.")end
+        return true
+    end
+
+    add("AIOS PIXEL LINEAGE - LAPORAN PEMERIKSAAN CLIENT v1.2")
     add("Waktu UTC: "..os.date("!%Y-%m-%dT%H:%M:%SZ"))
     add("GameId: "..tostring(game.GameId).." | PlaceId: "..tostring(game.PlaceId))
     add("Mode: snapshot baca-saja. Tidak ada remote yang dipanggil atau modul yang dijalankan.")
@@ -89,7 +239,7 @@ local function buildReport(deps)
     add("Tidak mengumpulkan profil, UserId, username, kunci, atau isi skrip lengkap.")
     add("")
     add("KEMAMPUAN PEMERIKSAAN")
-    for _,name in ipairs({"getscriptclosure","getconstants","getprotos","getproto"})do
+    for _,name in ipairs({"getscriptclosure","getconstants","getprotos","getproto","getgc","getfenv"})do
         add(name..": "..(type(caps[name])=="function"and"tersedia (masih bisa ditolak per skrip)"or"tidak tersedia"))
     end
     add("writefile: "..(caps.writefile and"tersedia"or"tidak tersedia").." | clipboard: "..(caps.clipboard and"tersedia"or"tidak tersedia"))
@@ -100,6 +250,7 @@ local function buildReport(deps)
         add("Pemeriksaan dihentikan sebelum membaca hierarki game lain.")
         return table.concat(lines,"\n"),stats
     end
+    selfTests()
 
     local storage=game:GetService("ReplicatedStorage")
     local scripts=child(player,"PlayerScripts")
@@ -163,6 +314,8 @@ local function buildReport(deps)
     add("REMOTE YANG TERLIHAT (nama/path; tidak dipanggil)")
     if #foundRemotes==0 then add("Tidak ditemukan pada root yang diperiksa.")end
     for _,entry in ipairs(foundRemotes)do add(entry.kind.." | "..entry.path)end
+    add("")
+    if not inspectLoaded(foundScripts)then return nil,stats end
     add("")
     add("PEMILIHAN PEMERIKSAAN")
     add(string.format("Skrip ditemukan: %d (Shared: %d; client/lainnya: %d). Metadata disimpan: %d.",stats.scripts,stats.shared,stats.client,#foundScripts))
@@ -292,11 +445,13 @@ local function buildReport(deps)
     add(string.format("Analisis Shared: %d | Analisis client/lainnya: %d",stats.analyzedShared,stats.analyzedClient),true)
     add(string.format("Source terbaca: %d | Closure terbaca: %d | Tabel konstanta terbaca: %d | Pemeriksaan ditolak/gagal: %d",stats.sources,stats.closures,stats.constants,stats.errors),true)
     add(string.format("Proto: pemeriksaan=%d; daftar kosong=%d; anak terbaca=%d; fallback indeks=%d",stats.protoCalls,stats.protoEmpty,stats.protoChildren,stats.protoFallback),true)
+    add(string.format("Fungsi dimuat: referensi=%d; fungsi terkait=%d; konstanta terbaca=%d; ditolak=%d; baris hasil=%d",stats.liveReferences,stats.liveFunctions,stats.liveConstants,stats.liveDenied,stats.liveRows),true)
+    add("Status fungsi dimuat: "..stats.liveStatus,true)
     if stats.closures>0 and stats.functions==stats.closures then
         add("Catatan: hanya fungsi terluar yang terbaca. Bisa karena tidak ada proto yang tersedia atau keterbatasan implementasi executor; belum bisa dibedakan dari laporan ini.",true)
     end
     add("Cakupan: "..(stats.truncated and"dibatasi; ada bagian yang tidak diperiksa/ditampilkan"or"root yang tersedia telah diperiksa dalam batas laporan"),true)
-    add("Tidak membaca ServerScriptService, ServerStorage, heap global, upvalue, profil, atau lalu lintas pemain.",true)
+    add("Tidak membaca ServerScriptService, ServerStorage, tabel GC, upvalue, profil, atau lalu lintas pemain. Referensi fungsi GC dicocokkan hanya melalui field script.",true)
     add("Hasil ini belum membuktikan spawn item atau one hit kill bisa dilakukan.",true)
     if stats.truncated then lines[#lines+1]="\n[PEMERIKSAAN DIBATASI; LAPORAN BUKAN HASIL LENGKAP]"end
     return table.concat(lines,"\n"),stats
@@ -362,7 +517,7 @@ local panel=create("Frame",{Name="Panel",AnchorPoint=Vector2.new(.5,.5),Position
     BackgroundColor3=rgb(20,24,32),BorderSizePixel=0,Parent=screen})
 create("UICorner",{CornerRadius=UDim.new(0,14),Parent=panel})
 create("UIStroke",{Color=rgb(230,143,66),Transparency=.25,Thickness=1,Parent=panel})
-local title=create("TextLabel",{Name="Title",Text="AIOS Inspector 1.1",Font=Enum.Font.GothamBold,TextSize=22,
+local title=create("TextLabel",{Name="Title",Text="AIOS Inspector 1.2",Font=Enum.Font.GothamBold,TextSize=22,
     TextColor3=rgb(255,176,94),TextXAlignment=Enum.TextXAlignment.Left,BackgroundTransparency=1,
     Position=UDim2.fromOffset(18,12),Size=UDim2.new(1,-78,0,28),Parent=panel})
 local close=create("TextButton",{Name="Close",Text="×",TextSize=28,Font=Enum.Font.Gotham,
@@ -412,6 +567,10 @@ local caps={getscriptclosure=type(getscriptclosure)=="function"and getscriptclos
     getconstants=type(getconstants)=="function"and getconstants or debugTable.getconstants,
     getprotos=type(getprotos)=="function"and getprotos or debugTable.getprotos,
     getproto=type(getproto)=="function"and getproto or debugTable.getproto,
+    getgc=type(getgc)=="function"and getgc or nil,
+    getfenv=type(getfenv)=="function"and getfenv or nil,
+    isexecutorclosure=type(isexecutorclosure)=="function"and isexecutorclosure or nil,
+    info=debugTable.info,
     writefile=type(writefile)=="function",clipboard=type(setclipboard)=="function"or type(toclipboard)=="function"}
 local clipboard=type(setclipboard)=="function"and setclipboard or type(toclipboard)=="function"and toclipboard or nil
 local exporter=makeExporter({writefile=writefile,readfile=readfile,isfile=isfile,clipboard=clipboard,newName=function()
