@@ -1,7 +1,7 @@
 -- Runtime UI inspection, scoped to the hub selected by the user.
 -- Reads UI text and available callback metadata/constants. Does not execute
 -- callbacks, hook authentication, inspect all GC objects, or dump input values.
--- Version 3: finds nested hub GUIs and distinguishes executor menus from hubs.
+-- Version 4: one scan button always reads UI plus available callback metadata.
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
 local SCRIPT_ID = "20a3558e57a0b4dca7cb38cfca83c56e"
@@ -390,7 +390,7 @@ local function startObservation(session)
 end
 local function reportOf(session)
     return {
-        format = "HUB_FEATURE_INSPECTION_V1", inspector_version = 3, created_at = session.createdAt, exported_at = os.time(),
+        format = "HUB_FEATURE_INSPECTION_V1", inspector_version = 4, created_at = session.createdAt, exported_at = os.time(),
         target_loader_id = SCRIPT_ID, place_id = game.PlaceId, universe_id = game.GameId,
         selected_gui = {name = session.rootName, class = session.rootClass}, capabilities = caps(),
         limits = LIMITS, controls = session.controls, functions = session.functions,
@@ -447,9 +447,9 @@ local function label(text, pos, size, color)
         TextColor3 = color or C.text, TextSize = 13, Font = Enum.Font.Gotham, TextWrapped = true,
         TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Center}, frame)
 end
-local title = label("AIOS · Periksa fitur hub v3", UDim2.new(0, 16, 0, 10), UDim2.new(1, -68, 0, 29))
+local title = label("AIOS · Periksa fitur hub v4", UDim2.new(0, 16, 0, 10), UDim2.new(1, -68, 0, 29))
 title.Font = Enum.Font.GothamBold; title.TextSize = 18
-label("Jalankan hub asli dahulu. Pilih GUI hub, lalu pindai. Buka tab lain dan pindai lagi untuk melengkapi laporan.",
+label("Pilih GUI hub lalu Pindai semua. Menu, tombol, dan callback yang bisa dibaca diperiksa sekaligus.",
     UDim2.new(0, 16, 0, 43), UDim2.new(1, -32, 0, 34), C.muted).TextSize = 12
 local function button(text, pos, size, parent)
     local obj = make("TextButton", {Text = text, Position = pos, Size = size, BackgroundColor3 = C.panel,
@@ -458,7 +458,7 @@ local function button(text, pos, size, parent)
 end
 local close = button("X", UDim2.new(1, -44, 0, 10), UDim2.new(0, 30, 0, 29))
 local find = button("Cari hub", UDim2.new(0, 16, 0, 83), UDim2.new(0.32, -12, 0, 32))
-local scan = button("Pindai UI", UDim2.new(0.32, 8, 0, 83), UDim2.new(0.34, -12, 0, 32))
+local scan = button("Pindai semua", UDim2.new(0.32, 8, 0, 83), UDim2.new(0.34, -12, 0, 32))
 local watch = button("Pantau tombol", UDim2.new(0.66, 4, 0, 83), UDim2.new(0.34, -20, 0, 32))
 local list = make("ScrollingFrame", {Position = UDim2.new(0, 16, 0, 123), Size = UDim2.new(1, -32, 1, -283),
     BackgroundColor3 = C.panel, BorderSizePixel = 0, ScrollBarThickness = 5, CanvasSize = UDim2.new(),
@@ -467,9 +467,7 @@ round(list)
 make("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder}, list)
 make("UIPadding", {PaddingTop = UDim.new(0, 5), PaddingBottom = UDim.new(0, 5), PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 5)}, list)
 local selectedLabel = label("Belum ada hub dipilih.", UDim2.new(0, 16, 1, -155), UDim2.new(1, -32, 0, 38))
-selectedLabel.Size = UDim2.new(1, -161, 0, 38)
 selectedLabel.TextSize = 12
-local mode = button("UI saja: ON", UDim2.new(1, -137, 1, -152), UDim2.new(0, 121, 0, 32))
 local status = label("", UDim2.new(0, 16, 1, -113), UDim2.new(1, -32, 0, 49), C.muted)
 local previous = button("<", UDim2.new(0, 16, 1, -59), UDim2.new(0, 42, 0, 34))
 local copy = button("Salin laporan", UDim2.new(0, 65, 1, -59), UDim2.new(1, -130, 0, 34))
@@ -477,7 +475,7 @@ copy.BackgroundColor3 = C.orange; copy.TextColor3 = C.bg
 local nextButton = button(">", UDim2.new(1, -58, 1, -59), UDim2.new(0, 42, 0, 34))
 label("Salin semua bagian ke satu .txt atau dokumen, lalu kirim di chat.", UDim2.new(0, 16, 1, -24), UDim2.new(1, -32, 0, 23), C.muted).TextSize = 10
 local session, frozen, exportName, exportChecksum, part, busy, closed = nil, nil, nil, nil, 1, false, false
-local uiOnly, lastFailure, lastPhase, currentPhase = true, nil, "", "idle"
+local lastFailure, lastPhase, currentPhase = nil, "", "idle"
 local discoverySummary = "Daftar GUI belum dibuat."
 local function setStatus(text) if not closed and gui.Parent then status.Text = text end end
 local function update()
@@ -489,8 +487,8 @@ local function update()
 end
 local function clearExport() frozen, exportName, exportChecksum, part = nil, nil, nil, 1 end
 local function diagnosticText()
-    local lines = {"AIOS Feature Inspector v3", "Stage: " .. lastPhase,
-        "Error: " .. (lastFailure or "none"), "UI-only mode: " .. tostring(uiOnly),
+    local lines = {"AIOS Feature Inspector v4", "Stage: " .. lastPhase,
+        "Error: " .. (lastFailure or "none"), "Scan: UI + callback metadata (automatic)",
         "Selected GUI: " .. (session and session.rootName or "none")}
     for name, available in pairs(caps()) do lines[#lines + 1] = name .. ": " .. tostring(available) end
     if session then
@@ -616,7 +614,7 @@ local function discover()
             end
             if not session or session.root ~= target then stopObservation(session); session = newSession(target) end
             lastFailure = nil; clearExport(); update()
-            setStatus(uiOnly and "Hub dipilih. Tekan Pindai UI untuk membaca daftar fiturnya." or "Hub dipilih. Tekan Pindai fitur untuk memeriksa callback juga.")
+            setStatus("Hub dipilih. Tekan Pindai semua untuk membaca UI dan callback sekaligus.")
         end)
     end
     if #queue >= 16000 then summary[#summary + 1] = "GUI search reached its traversal limit." end
@@ -626,22 +624,13 @@ local function discover()
     setStatus(#candidates .. " GUI ditemukan. Utamakan kandidat yang menampilkan Terdsak / Auto Farm. Salin daftar GUI jika belum ditemukan.")
 end
 find.Activated:Connect(function() work("cari GUI", discover) end)
-mode.Activated:Connect(function()
-    if busy then return end
-    stopObservation(session); watch.Text = "Pantau tombol"
-    uiOnly = not uiOnly
-    mode.Text = uiOnly and "UI saja: ON" or "UI saja: OFF"
-    scan.Text = uiOnly and "Pindai UI" or "Pindai fitur"
-    lastFailure = nil; clearExport(); update()
-    setStatus(uiOnly and "Mode UI saja aktif. Pembacaan fungsi executor dilewati." or "Mode lengkap aktif. Callback yang dapat diakses ikut diperiksa.")
-end)
 scan.Activated:Connect(function()
     if not session then setStatus("Pilih GUI hub dari daftar terlebih dahulu."); return end
     work("pindai", function()
         stopObservation(session); watch.Text = "Pantau tombol"
-        clearExport(); setStatus(uiOnly and "Membaca menu dan tombol..." or "Memeriksa UI dan callback yang bisa dibaca...")
-        currentPhase = uiOnly and "baca UI" or "baca UI/callback"
-        scanSession(session, not uiOnly)
+        clearExport(); setStatus("Memeriksa menu, tombol, dan callback yang bisa dibaca...")
+        currentPhase = "baca UI/callback"
+        scanSession(session, true)
         if closed then return end
         update()
         setStatus("Pindai selesai: " .. #session.controls .. " kontrol, " .. #session.functions .. " fungsi. Buka tab lain lalu pindai lagi, atau salin laporan.")
@@ -649,7 +638,7 @@ scan.Activated:Connect(function()
 end)
 watch.Activated:Connect(function()
     if busy then return end
-    if not session or #session.controls == 0 then setStatus("Pilih hub dan Pindai fitur dahulu."); return end
+    if not session or #session.controls == 0 then setStatus("Pilih hub dan Pindai semua dahulu."); return end
     clearExport()
     if session.observation then
         stopObservation(session); watch.Text = "Pantau tombol"; update()
@@ -676,7 +665,7 @@ copy.Activated:Connect(function()
         setStatus(ok and value ~= false and "Daftar GUI disalin. Tempel teksnya langsung di chat." or "Clipboard gagal. Kirim screenshot daftar GUI.")
         return
     end
-    if not session or #session.scans == 0 then setStatus("Pilih hub lalu Pindai fitur dahulu."); return end
+    if not session or #session.scans == 0 then setStatus("Pilih hub lalu Pindai semua dahulu."); return end
     if not clipboard then setStatus("Clipboard tidak tersedia di executor ini. Kirim screenshot ringkasannya."); return end
     work("ekspor", function()
         if not frozen then
