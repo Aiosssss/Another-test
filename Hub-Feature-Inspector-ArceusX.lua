@@ -1,6 +1,7 @@
 -- Runtime UI inspection, scoped to the hub selected by the user.
 -- Reads UI text and available callback metadata/constants. Does not execute
 -- callbacks, hook authentication, inspect all GC objects, or dump input values.
+-- Version 2: UI-only mode by default, per-control recovery and copyable errors.
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
 local SCRIPT_ID = "20a3558e57a0b4dca7cb38cfca83c56e"
@@ -87,15 +88,41 @@ local function sensitive(text)
     end
     return lower:match("%f[%a]key%f[%A]") ~= nil
 end
+local function utf8Prefix(text, limit)
+    local out, used, i = {}, 0, 1
+    while i <= #text and used < limit do
+        local a = text:byte(i)
+        local width = a < 128 and 1 or (a >= 194 and a <= 223 and 2)
+            or (a >= 224 and a <= 239 and 3) or (a >= 240 and a <= 244 and 4) or 0
+        local valid = width > 0 and i + width - 1 <= #text
+        if valid and width > 1 then
+            for j = 1, width - 1 do
+                local b = text:byte(i + j)
+                if b < 128 or b > 191 then valid = false; break end
+            end
+            local b = text:byte(i + 1)
+            if (a == 224 and b < 160) or (a == 237 and b > 159)
+                or (a == 240 and b < 144) or (a == 244 and b > 143) then valid = false end
+        end
+        if valid then
+            if used + width > limit then break end
+            out[#out + 1] = text:sub(i, i + width - 1)
+            i, used = i + width, used + width
+        else out[#out + 1] = "?"; i, used = i + 1, used + 1 end
+    end
+    return table.concat(out)
+end
 local function clean(value, maxLength)
-    local text = tostring(value or ""):gsub("[%c]", " ")
+    local kind = type(value)
+    local text = kind == "string" and value or ((kind == "number" or kind == "boolean") and tostring(value) or "")
+    text = text:gsub("[%c]", " ")
     -- Avoid exporting URLs, opaque keys, or identifiers embedded in labels.
     text = text:gsub("https?://[^%s]+", "[URL]")
     text = text:gsub("[%w_%-]+", function(word)
         if #word >= 28 then return "[opaque value]" end
         return word
     end)
-    return text:sub(1, maxLength or 150)
+    return utf8Prefix(text, maxLength or 150)
 end
 local function nameOf(obj)
     return clean(readProperty(obj, "Name") or "?", 80)
@@ -154,7 +181,7 @@ local function note(session, message)
     end
 end
 local inspectFunction
-inspectFunction = function(session, fn, depth)
+local function inspectFunctionInner(session, fn, depth)
     if type(fn) ~= "function" then return nil end
     if session.functionIds[fn] then return session.functionIds[fn] end
     if #session.functions >= LIMITS.functions then note(session, "Function limit reached"); return nil end
@@ -228,6 +255,19 @@ inspectFunction = function(session, fn, depth)
     end
     return id
 end
+inspectFunction = function(session, fn, depth)
+    local ok, result = pcall(inspectFunctionInner, session, fn, depth)
+    if ok then return result end
+    local message = "Callback inspection error: " .. clean(result, 180)
+    note(session, message)
+    local id = session.functionIds[fn]
+    if id then
+        for _, item in ipairs(session.functions) do
+            if item.id == id then item.inspection_error = clean(result, 180); break end
+        end
+    end
+    return id
+end
 local function inspectEvent(session, obj, eventName)
     if type(connectionsAPI) ~= "function" then return nil end
     local signal = readProperty(obj, eventName)
@@ -249,7 +289,7 @@ local function inspectEvent(session, obj, eventName)
     end
     return item
 end
-local function addControl(session, obj)
+local function addControl(session, obj, inspectCallbacks)
     if privateNode(obj, session.root) then session.skippedPrivate = session.skippedPrivate + 1; return nil end
     local id = session.controlIds[obj]
     local item
@@ -267,7 +307,9 @@ local function addControl(session, obj)
     item.text = displayText(obj, session.root)
     item.visible = readProperty(obj, "Visible") == true
     item.last_seen = os.time()
-    if isA(obj, "GuiButton") or isA(obj, "TextButton") or isA(obj, "ImageButton") then
+    if inspectCallbacks == false then
+        item.events = {}
+    elseif isA(obj, "GuiButton") or isA(obj, "TextButton") or isA(obj, "ImageButton") then
         item.events = {}
         for _, eventName in ipairs({"Activated", "MouseButton1Click", "MouseButton1Down"}) do
             local event = inspectEvent(session, obj, eventName)
@@ -279,21 +321,25 @@ local function addControl(session, obj)
     end
     return item
 end
-local function scanSession(session)
+local function scanSession(session, inspectCallbacks)
     if #session.scans >= LIMITS.scans then note(session, "Scan limit reached; select the hub again for a new session"); return end
     local all, processed = children(session.root, true), 0
     for i, obj in ipairs(all) do
         if i > 12000 then note(session, "GUI descendant scan limit reached"); break end
         if isA(obj, "TextLabel") or isA(obj, "TextButton") or isA(obj, "ImageButton")
             or isA(obj, "TextBox") or isA(obj, "ScrollingFrame") then
-            addControl(session, obj)
+            local ok, failure = pcall(addControl, session, obj, inspectCallbacks)
+            if not ok then note(session, "Control inspection error: " .. clean(failure, 180)) end
             processed = processed + 1
             if processed % 35 == 0 then task.wait() end
         end
     end
-    session.scans[#session.scans + 1] = {time = os.time(), inspected_controls = processed}
-    if not connectionsAPI then note(session, "getconnections unavailable; only UI metadata was collected") end
-    if not constantsAPI then note(session, "getconstants unavailable; no callback constants were collected") end
+    session.scans[#session.scans + 1] = {time = os.time(), inspected_controls = processed, callbacks_requested = inspectCallbacks ~= false}
+    if inspectCallbacks == false then note(session, "UI-only mode selected; callback inspection was skipped")
+    else
+        if not connectionsAPI then note(session, "getconnections unavailable; only UI metadata was collected") end
+        if not constantsAPI then note(session, "getconstants unavailable; no callback constants were collected") end
+    end
 end
 local function stopObservation(session)
     if not session then return end
@@ -324,7 +370,7 @@ local function startObservation(session)
 end
 local function reportOf(session)
     return {
-        format = "HUB_FEATURE_INSPECTION_V1", created_at = session.createdAt, exported_at = os.time(),
+        format = "HUB_FEATURE_INSPECTION_V1", inspector_version = 2, created_at = session.createdAt, exported_at = os.time(),
         target_loader_id = SCRIPT_ID, place_id = game.PlaceId, universe_id = game.GameId,
         selected_gui = {name = session.rootName, class = session.rootClass}, capabilities = caps(),
         limits = LIMITS, controls = session.controls, functions = session.functions,
@@ -381,7 +427,7 @@ local function label(text, pos, size, color)
         TextColor3 = color or C.text, TextSize = 13, Font = Enum.Font.Gotham, TextWrapped = true,
         TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Center}, frame)
 end
-local title = label("AIOS · Periksa fitur hub", UDim2.new(0, 16, 0, 10), UDim2.new(1, -68, 0, 29))
+local title = label("AIOS · Periksa fitur hub v2", UDim2.new(0, 16, 0, 10), UDim2.new(1, -68, 0, 29))
 title.Font = Enum.Font.GothamBold; title.TextSize = 18
 label("Jalankan hub asli dahulu. Pilih GUI hub, lalu pindai. Buka tab lain dan pindai lagi untuk melengkapi laporan.",
     UDim2.new(0, 16, 0, 43), UDim2.new(1, -32, 0, 34), C.muted).TextSize = 12
@@ -392,7 +438,7 @@ local function button(text, pos, size, parent)
 end
 local close = button("X", UDim2.new(1, -44, 0, 10), UDim2.new(0, 30, 0, 29))
 local find = button("Cari hub", UDim2.new(0, 16, 0, 83), UDim2.new(0.32, -12, 0, 32))
-local scan = button("Pindai fitur", UDim2.new(0.32, 8, 0, 83), UDim2.new(0.34, -12, 0, 32))
+local scan = button("Pindai UI", UDim2.new(0.32, 8, 0, 83), UDim2.new(0.34, -12, 0, 32))
 local watch = button("Pantau tombol", UDim2.new(0.66, 4, 0, 83), UDim2.new(0.34, -20, 0, 32))
 local list = make("ScrollingFrame", {Position = UDim2.new(0, 16, 0, 123), Size = UDim2.new(1, -32, 1, -283),
     BackgroundColor3 = C.panel, BorderSizePixel = 0, ScrollBarThickness = 5, CanvasSize = UDim2.new(),
@@ -401,6 +447,9 @@ round(list)
 make("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder}, list)
 make("UIPadding", {PaddingTop = UDim.new(0, 5), PaddingBottom = UDim.new(0, 5), PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 5)}, list)
 local selectedLabel = label("Belum ada hub dipilih.", UDim2.new(0, 16, 1, -155), UDim2.new(1, -32, 0, 38))
+selectedLabel.Size = UDim2.new(1, -161, 0, 38)
+selectedLabel.TextSize = 12
+local mode = button("UI saja: ON", UDim2.new(1, -137, 1, -152), UDim2.new(0, 121, 0, 32))
 local status = label("", UDim2.new(0, 16, 1, -113), UDim2.new(1, -32, 0, 49), C.muted)
 local previous = button("<", UDim2.new(0, 16, 1, -59), UDim2.new(0, 42, 0, 34))
 local copy = button("Salin laporan", UDim2.new(0, 65, 1, -59), UDim2.new(1, -130, 0, 34))
@@ -408,14 +457,27 @@ copy.BackgroundColor3 = C.orange; copy.TextColor3 = C.bg
 local nextButton = button(">", UDim2.new(1, -58, 1, -59), UDim2.new(0, 42, 0, 34))
 label("Salin semua bagian ke satu .txt atau dokumen, lalu kirim di chat.", UDim2.new(0, 16, 1, -24), UDim2.new(1, -32, 0, 23), C.muted).TextSize = 10
 local session, frozen, exportName, exportChecksum, part, busy, closed = nil, nil, nil, nil, 1, false, false
+local uiOnly, lastFailure, lastPhase, currentPhase = true, nil, "", "idle"
 local function setStatus(text) if not closed and gui.Parent then status.Text = text end end
 local function update()
     if not session then return end
-    selectedLabel.Text = session.rootName .. " · " .. #session.controls .. " kontrol · " .. #session.functions .. " fungsi · " .. #session.actions .. " aksi"
-    if frozen then copy.Text = "Salin bagian " .. part .. "/" .. math.max(1, math.ceil(#frozen / CHUNK_BYTES))
+    selectedLabel.Text = session.rootName .. " · " .. #session.controls .. " kontrol · " .. #session.functions .. " fungsi"
+    if lastFailure then copy.Text = "Salin diagnosis"
+    elseif frozen then copy.Text = "Salin bagian " .. part .. "/" .. math.max(1, math.ceil(#frozen / CHUNK_BYTES))
     else copy.Text = "Salin laporan" end
 end
 local function clearExport() frozen, exportName, exportChecksum, part = nil, nil, nil, 1 end
+local function diagnosticText()
+    local lines = {"AIOS Feature Inspector v2", "Stage: " .. lastPhase,
+        "Error: " .. (lastFailure or "none"), "UI-only mode: " .. tostring(uiOnly),
+        "Selected GUI: " .. (session and session.rootName or "none")}
+    for name, available in pairs(caps()) do lines[#lines + 1] = name .. ": " .. tostring(available) end
+    if session then
+        lines[#lines + 1] = "Controls: " .. #session.controls .. "; functions: " .. #session.functions
+        for i = 1, math.min(4, #session.notes) do lines[#lines + 1] = "Note: " .. session.notes[i] end
+    end
+    return table.concat(lines, "\n")
+end
 local function cleanup()
     stopObservation(session)
     closed = true
@@ -423,13 +485,18 @@ local function cleanup()
 end
 env.AIOSFeatureInspectorCleanup = cleanup
 close.Activated:Connect(cleanup)
-local function work(fn)
+local function work(operation, fn)
     if busy then setStatus("Proses sebelumnya masih berjalan."); return end
     busy = true
+    currentPhase, lastFailure, lastPhase = operation, nil, ""
     task.spawn(function()
-        local ok = pcall(fn)
+        local ok, failure = pcall(fn)
         busy = false
-        if not ok then setStatus("Pemeriksaan gagal pada executor ini. Kirim screenshot pesan atau daftar hub.") end
+        if not ok then
+            lastFailure, lastPhase = clean(failure, 400), currentPhase
+            copy.Text = "Salin diagnosis"
+            setStatus("Gagal pada " .. currentPhase .. ": " .. clean(failure, 110) .. ". Tekan Salin diagnosis.")
+        end
     end)
 end
 local function preview(root)
@@ -447,7 +514,6 @@ local function preview(root)
     return table.concat(pieces, " · ")
 end
 local function discover()
-    if busy then return end
     for _, obj in ipairs(children(list)) do if isA(obj, "TextButton") then obj:Destroy() end end
     local seen, candidates = {}, {}
     local excluded = {RobloxGui=true, RobloxPromptGui=true, TouchGui=true, BubbleChat=true,
@@ -481,22 +547,32 @@ local function discover()
         row.Activated:Connect(function()
             if busy then return end
             if not session or session.root ~= target then stopObservation(session); session = newSession(target) end
-            clearExport(); update()
-            setStatus("Hub dipilih. Tekan Pindai fitur. Metadata yang tertutup bisa tetap tidak terbaca.")
+            lastFailure = nil; clearExport(); update()
+            setStatus(uiOnly and "Hub dipilih. Tekan Pindai UI untuk membaca daftar fiturnya." or "Hub dipilih. Tekan Pindai fitur untuk memeriksa callback juga.")
         end)
     end
     setStatus(#candidates .. " GUI ditemukan. Pilih yang berisi nama atau menu hub kamu, lalu Pindai fitur.")
 end
-find.Activated:Connect(discover)
+find.Activated:Connect(function() work("cari GUI", discover) end)
+mode.Activated:Connect(function()
+    if busy then return end
+    stopObservation(session); watch.Text = "Pantau tombol"
+    uiOnly = not uiOnly
+    mode.Text = uiOnly and "UI saja: ON" or "UI saja: OFF"
+    scan.Text = uiOnly and "Pindai UI" or "Pindai fitur"
+    lastFailure = nil; clearExport(); update()
+    setStatus(uiOnly and "Mode UI saja aktif. Pembacaan fungsi executor dilewati." or "Mode lengkap aktif. Callback yang dapat diakses ikut diperiksa.")
+end)
 scan.Activated:Connect(function()
     if not session then setStatus("Pilih GUI hub dari daftar terlebih dahulu."); return end
-    work(function()
+    work("pindai", function()
         stopObservation(session); watch.Text = "Pantau tombol"
-        clearExport(); setStatus("Memeriksa UI dan callback yang bisa dibaca...")
-        scanSession(session)
+        clearExport(); setStatus(uiOnly and "Membaca menu dan tombol..." or "Memeriksa UI dan callback yang bisa dibaca...")
+        currentPhase = uiOnly and "baca UI" or "baca UI/callback"
+        scanSession(session, not uiOnly)
         if closed then return end
         update()
-        setStatus("Pindai selesai. Buka tab lain di hub lalu pindai lagi, atau salin laporan.")
+        setStatus("Pindai selesai: " .. #session.controls .. " kontrol, " .. #session.functions .. " fungsi. Buka tab lain lalu pindai lagi, atau salin laporan.")
     end)
 end)
 watch.Activated:Connect(function()
@@ -516,16 +592,27 @@ nextButton.Activated:Connect(function()
     if frozen and not busy then part = math.min(math.ceil(#frozen / CHUNK_BYTES), part + 1); update() end
 end)
 copy.Activated:Connect(function()
+    if lastFailure then
+        if not clipboard then setStatus("Clipboard tidak tersedia. Kirim screenshot detail error di layar."); return end
+        local ok, value = pcall(clipboard, diagnosticText())
+        setStatus(ok and value ~= false and "Diagnosis disalin. Tempel teksnya langsung di chat." or "Clipboard gagal. Kirim screenshot detail error.")
+        return
+    end
     if not session or #session.scans == 0 then setStatus("Pilih hub lalu Pindai fitur dahulu."); return end
     if not clipboard then setStatus("Clipboard tidak tersedia di executor ini. Kirim screenshot ringkasannya."); return end
-    work(function()
+    work("ekspor", function()
         if not frozen then
             stopObservation(session); watch.Text = "Pantau tombol"
-            frozen = HttpService:JSONEncode(reportOf(session))
+            currentPhase = "JSONEncode laporan"
+            local encodedReport = HttpService:JSONEncode(reportOf(session))
+            currentPhase = "checksum laporan"
+            local checksum = adler32(encodedReport)
+            frozen, exportChecksum = encodedReport, checksum
             exportName = "Hub-Feature-Report-" .. os.time() .. ".json"
-            exportChecksum = adler32(frozen); part = 1
+            part = 1
         end
         setStatus("Menyiapkan bagian " .. part .. "...")
+        currentPhase = "membuat bagian ekspor"
         local encoded, total = packet(frozen, exportName, "runtime_inspection", exportChecksum, part)
         local ok, value = pcall(clipboard, encoded)
         update()
@@ -533,4 +620,4 @@ copy.Activated:Connect(function()
             or "Clipboard gagal. Coba salin bagian yang sama lagi.")
     end)
 end)
-discover()
+work("cari GUI awal", discover)
