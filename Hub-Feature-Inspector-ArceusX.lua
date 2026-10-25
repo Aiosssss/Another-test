@@ -1,7 +1,7 @@
 -- Runtime UI inspection, scoped to the hub selected by the user.
 -- Reads UI text and available callback metadata/constants. Does not execute
 -- callbacks, hook authentication, inspect all GC objects, or dump input values.
--- Version 2: UI-only mode by default, per-control recovery and copyable errors.
+-- Version 3: finds nested hub GUIs and distinguishes executor menus from hubs.
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
 local SCRIPT_ID = "20a3558e57a0b4dca7cb38cfca83c56e"
@@ -80,6 +80,23 @@ local function children(obj, descendants)
         return obj:GetChildren()
     end)
     return ok and type(value) == "table" and value or {}
+end
+local function surfaceNodes(root, limit)
+    local queue, result, seen, cursor, nested = {root}, {}, {[root] = true}, 1, 0
+    limit = limit or 12000
+    while cursor <= #queue and cursor <= limit do
+        local obj = queue[cursor]; cursor = cursor + 1
+        if obj ~= root and isA(obj, "ScreenGui") then
+            nested = nested + 1
+        else
+            if obj ~= root then result[#result + 1] = obj end
+            for _, child in ipairs(children(obj)) do
+                if not seen[child] and #queue < limit then seen[child] = true; queue[#queue + 1] = child end
+            end
+        end
+        if cursor % 150 == 0 then task.wait() end
+    end
+    return result, nested, #queue >= limit
 end
 local function sensitive(text)
     local lower = tostring(text or ""):lower()
@@ -323,7 +340,10 @@ local function addControl(session, obj, inspectCallbacks)
 end
 local function scanSession(session, inspectCallbacks)
     if #session.scans >= LIMITS.scans then note(session, "Scan limit reached; select the hub again for a new session"); return end
-    local all, processed = children(session.root, true), 0
+    local all, nested, truncated = surfaceNodes(session.root, 12000)
+    local processed = 0
+    if nested > 0 then note(session, "Nested ScreenGuis omitted; select the specific child hub GUI for its controls") end
+    if truncated then note(session, "GUI traversal limit reached") end
     for i, obj in ipairs(all) do
         if i > 12000 then note(session, "GUI descendant scan limit reached"); break end
         if isA(obj, "TextLabel") or isA(obj, "TextButton") or isA(obj, "ImageButton")
@@ -370,7 +390,7 @@ local function startObservation(session)
 end
 local function reportOf(session)
     return {
-        format = "HUB_FEATURE_INSPECTION_V1", inspector_version = 2, created_at = session.createdAt, exported_at = os.time(),
+        format = "HUB_FEATURE_INSPECTION_V1", inspector_version = 3, created_at = session.createdAt, exported_at = os.time(),
         target_loader_id = SCRIPT_ID, place_id = game.PlaceId, universe_id = game.GameId,
         selected_gui = {name = session.rootName, class = session.rootClass}, capabilities = caps(),
         limits = LIMITS, controls = session.controls, functions = session.functions,
@@ -427,7 +447,7 @@ local function label(text, pos, size, color)
         TextColor3 = color or C.text, TextSize = 13, Font = Enum.Font.Gotham, TextWrapped = true,
         TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Center}, frame)
 end
-local title = label("AIOS · Periksa fitur hub v2", UDim2.new(0, 16, 0, 10), UDim2.new(1, -68, 0, 29))
+local title = label("AIOS · Periksa fitur hub v3", UDim2.new(0, 16, 0, 10), UDim2.new(1, -68, 0, 29))
 title.Font = Enum.Font.GothamBold; title.TextSize = 18
 label("Jalankan hub asli dahulu. Pilih GUI hub, lalu pindai. Buka tab lain dan pindai lagi untuk melengkapi laporan.",
     UDim2.new(0, 16, 0, 43), UDim2.new(1, -32, 0, 34), C.muted).TextSize = 12
@@ -458,6 +478,7 @@ local nextButton = button(">", UDim2.new(1, -58, 1, -59), UDim2.new(0, 42, 0, 34
 label("Salin semua bagian ke satu .txt atau dokumen, lalu kirim di chat.", UDim2.new(0, 16, 1, -24), UDim2.new(1, -32, 0, 23), C.muted).TextSize = 10
 local session, frozen, exportName, exportChecksum, part, busy, closed = nil, nil, nil, nil, 1, false, false
 local uiOnly, lastFailure, lastPhase, currentPhase = true, nil, "", "idle"
+local discoverySummary = "Daftar GUI belum dibuat."
 local function setStatus(text) if not closed and gui.Parent then status.Text = text end end
 local function update()
     if not session then return end
@@ -468,7 +489,7 @@ local function update()
 end
 local function clearExport() frozen, exportName, exportChecksum, part = nil, nil, nil, 1 end
 local function diagnosticText()
-    local lines = {"AIOS Feature Inspector v2", "Stage: " .. lastPhase,
+    local lines = {"AIOS Feature Inspector v3", "Stage: " .. lastPhase,
         "Error: " .. (lastFailure or "none"), "UI-only mode: " .. tostring(uiOnly),
         "Selected GUI: " .. (session and session.rootName or "none")}
     for name, available in pairs(caps()) do lines[#lines + 1] = name .. ": " .. tostring(available) end
@@ -476,6 +497,7 @@ local function diagnosticText()
         lines[#lines + 1] = "Controls: " .. #session.controls .. "; functions: " .. #session.functions
         for i = 1, math.min(4, #session.notes) do lines[#lines + 1] = "Note: " .. session.notes[i] end
     end
+    lines[#lines + 1] = discoverySummary
     return table.concat(lines, "\n")
 end
 local function cleanup()
@@ -499,19 +521,39 @@ local function work(operation, fn)
         end
     end)
 end
-local function preview(root)
-    local pieces = {}
-    for i, obj in ipairs(children(root, true)) do
-        if i > 500 then break end
+local function candidateInfo(root)
+    local pieces, matches, executorMarkers, count = {}, {}, {}, 0
+    local nodes, nested = surfaceNodes(root, 3000)
+    local weights = {{"terdsak", 30}, {"auto farm", 10}, {"auto combat", 10}, {"boss rush", 10},
+        {"torment", 6}, {"replay", 4}, {"skill rotation", 6}, {"cinder", 20}, {"ouroboros", 20}, {"hub", 2}}
+    local signals = {"arceus x neo", "spdm team", "favourite scripts list", "@arceusx_team"}
+    for _, obj in ipairs(nodes) do
         if isA(obj, "TextLabel") or isA(obj, "TextButton") then
             local text = displayText(obj, root)
+            local lower = text:lower()
+            count = count + 1
+            for _, signal in ipairs(signals) do if lower:find(signal, 1, true) then executorMarkers[signal] = true end end
+            for _, pair in ipairs(weights) do
+                if lower:find(pair[1], 1, true) then matches[pair[1]] = text end
+            end
             if #text > 1 and #text < 65 and not text:find("omitted", 1, true) then
-                pieces[#pieces + 1] = text
-                if #pieces == 3 then break end
+                if #pieces < 3 then pieces[#pieces + 1] = text end
             end
         end
     end
-    return table.concat(pieces, " · ")
+    local score, markerCount, preferred, seen = 0, 0, {}, {}
+    for _, pair in ipairs(weights) do
+        local match = matches[pair[1]]
+        if match then
+            score = score + pair[2]
+            if not seen[match] and #preferred < 3 then preferred[#preferred + 1] = match; seen[match] = true end
+        end
+    end
+    for _ in pairs(executorMarkers) do markerCount = markerCount + 1 end
+    local executor = markerCount >= 2
+    local container = nested > 0 and count == 0
+    return {name = nameOf(root), score = score, executor = executor, container = container,
+        nested = nested, labels = count, preview = table.concat(#preferred > 0 and preferred or pieces, " · ")}
 end
 local function discover()
     for _, obj in ipairs(children(list)) do if isA(obj, "TextButton") then obj:Destroy() end end
@@ -523,35 +565,65 @@ local function discover()
         if seen[root] or root == gui or excluded[name] or name == "AIOSFeatureInspector" then return end
         seen[root] = true
         if not isA(root, "ScreenGui") then return end
+        if #candidates >= 100 then return end
         candidates[#candidates + 1] = root
     end
-    local function walk(root, depth)
-        if #candidates >= 70 then return end
-        if isA(root, "ScreenGui") then add(root); return end
-        if depth > 4 then return end
-        for i, child in ipairs(children(root)) do
-            if i > 200 then break end
-            if isA(child, "ScreenGui") then add(child)
-            elseif isA(child, "Folder") then walk(child, depth + 1) end
-        end
+    -- Continue through ScreenGui/Frame containers: gethui() can itself be a
+    -- ScreenGui containing the executor AND separate nested hub ScreenGuis.
+    local queue, visited, cursor = {}, {}, 1
+    for _, root in ipairs(roots) do
+        if not visited[root] then visited[root] = true; queue[#queue + 1] = root end
     end
-    for _, root in ipairs(roots) do walk(root, 0) end
-    table.sort(candidates, function(a, b) return nameOf(a) < nameOf(b) end)
+    while cursor <= #queue and cursor <= 16000 do
+        local root = queue[cursor]; cursor = cursor + 1
+        if root ~= gui then
+            if isA(root, "ScreenGui") then add(root) end
+            for _, child in ipairs(children(root)) do
+                if not visited[child] and #queue < 16000 then visited[child] = true; queue[#queue + 1] = child end
+            end
+        end
+        if cursor % 150 == 0 then task.wait() end
+    end
+    local metadata = {}
+    for _, root in ipairs(candidates) do metadata[root] = candidateInfo(root) end
+    table.sort(candidates, function(a, b)
+        local x, y = metadata[a], metadata[b]
+        local px = x.executor and -1000 or (x.container and -500 or x.score)
+        local py = y.executor and -1000 or (y.container and -500 or y.score)
+        return px == py and x.name < y.name or px > py
+    end)
+    local summary = {"GUI candidates (executor menus are not scanned):"}
     for _, root in ipairs(candidates) do
-        local target, text = root, nameOf(root)
-        local subtitle = preview(root)
-        if #subtitle > 0 then text = text .. "\n" .. subtitle end
+        local target, info = root, metadata[root]
+        local kind = info.executor and "menu executor" or (info.container and "wadah GUI" or (info.score > 0 and "kandidat hub" or "GUI"))
+        summary[#summary + 1] = info.name .. " [" .. kind .. "] · " .. info.preview
+        local text = info.name .. " · " .. kind
+        if info.executor then text = text .. "\nArceus X / SPDM — pilih GUI hub game"
+        elseif info.container then text = text .. "\nBerisi GUI anak. Pilih GUI anak yang menampilkan menu hub."
+        elseif #info.preview > 0 then text = text .. "\n" .. info.preview end
         local row = button(text, UDim2.new(), UDim2.new(1, -5, 0, 48), list)
         row.TextXAlignment = Enum.TextXAlignment.Left; row.TextSize = 12
         make("UIPadding", {PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8)}, row)
         row.Activated:Connect(function()
             if busy then return end
+            if info.executor or info.container then
+                lastPhase = "pemilihan GUI"
+                lastFailure = info.executor and ("GUI " .. info.name .. " terdeteksi sebagai menu executor, bukan target hub game.")
+                    or ("GUI " .. info.name .. " adalah wadah. Pilih GUI anak yang memuat menu hub.")
+                copy.Text = "Salin diagnosis"
+                setStatus(lastFailure .. " Jika hub belum terlihat, tekan Salin diagnosis.")
+                return
+            end
             if not session or session.root ~= target then stopObservation(session); session = newSession(target) end
             lastFailure = nil; clearExport(); update()
             setStatus(uiOnly and "Hub dipilih. Tekan Pindai UI untuk membaca daftar fiturnya." or "Hub dipilih. Tekan Pindai fitur untuk memeriksa callback juga.")
         end)
     end
-    setStatus(#candidates .. " GUI ditemukan. Pilih yang berisi nama atau menu hub kamu, lalu Pindai fitur.")
+    if #queue >= 16000 then summary[#summary + 1] = "GUI search reached its traversal limit." end
+    if #candidates >= 100 then summary[#summary + 1] = "GUI candidate limit reached." end
+    discoverySummary = table.concat(summary, "\n")
+    if not session and not lastFailure then copy.Text = "Salin daftar GUI" end
+    setStatus(#candidates .. " GUI ditemukan. Utamakan kandidat yang menampilkan Terdsak / Auto Farm. Salin daftar GUI jika belum ditemukan.")
 end
 find.Activated:Connect(function() work("cari GUI", discover) end)
 mode.Activated:Connect(function()
@@ -596,6 +668,12 @@ copy.Activated:Connect(function()
         if not clipboard then setStatus("Clipboard tidak tersedia. Kirim screenshot detail error di layar."); return end
         local ok, value = pcall(clipboard, diagnosticText())
         setStatus(ok and value ~= false and "Diagnosis disalin. Tempel teksnya langsung di chat." or "Clipboard gagal. Kirim screenshot detail error.")
+        return
+    end
+    if not session then
+        if not clipboard then setStatus("Clipboard tidak tersedia. Kirim screenshot daftar GUI."); return end
+        local ok, value = pcall(clipboard, diagnosticText())
+        setStatus(ok and value ~= false and "Daftar GUI disalin. Tempel teksnya langsung di chat." or "Clipboard gagal. Kirim screenshot daftar GUI.")
         return
     end
     if not session or #session.scans == 0 then setStatus("Pilih hub lalu Pindai fitur dahulu."); return end
